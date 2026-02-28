@@ -54,8 +54,20 @@ final class OpenClawClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("ios-user-1", forHTTPHeaderField: "x-ios-user-id")
 
-        let body: [String: Any] = ["message": message, "sessionId": "ios-user-1"]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        // Manually format JSON string to guarantee exact layout expected by OpenClaw sub-agents
+        let escapedMessage = message
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            
+        let jsonString = """
+        {
+            "message": "\(escapedMessage)",
+            "sessionId": "ios-user-1"
+        }
+        """
+        request.httpBody = jsonString.data(using: .utf8)
+        print("🌐 OpenClawClient: Sending request body: \(jsonString)")
 
         let (data, response) = try await session.data(for: request)
 
@@ -93,6 +105,48 @@ final class OpenClawClient {
         let (_, response) = try await session.data(for: request)
         return (response as? HTTPURLResponse)?.statusCode == 200
     }
+    /// Fetch asynchronous events (like sub-agent results) from the server.
+    func fetchEvents(since timestamp: Int64) async throws -> [OpenClawEvent] {
+        guard let url = URL(string: "\(baseURL)/events?sessionId=ios-user-1&since=\(timestamp)&limit=50") else {
+            throw OpenClawError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(appToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("ios-user-1", forHTTPHeaderField: "x-ios-user-id")
+
+        let (data, response) = try await session.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw OpenClawError.invalidResponse
+        }
+
+        if httpResponse.statusCode != 200 {
+            throw OpenClawError.httpError(httpResponse.statusCode)
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let eventsArray = json["events"] as? [[String: Any]] else {
+            throw OpenClawError.invalidJSON
+        }
+
+        var events: [OpenClawEvent] = []
+        for dict in eventsArray {
+            if let type = dict["type"] as? String,
+               let text = dict["text"] as? String,
+               let ts = dict["timestamp"] as? Int64 {
+                events.append(OpenClawEvent(type: type, text: text, timestamp: ts))
+            }
+        }
+        return events
+    }
+}
+
+struct OpenClawEvent {
+    let type: String
+    let text: String
+    let timestamp: Int64
 }
 
 enum OpenClawError: LocalizedError {

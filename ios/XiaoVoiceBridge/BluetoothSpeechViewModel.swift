@@ -9,7 +9,7 @@ import UIKit
 
 final class BluetoothSpeechViewModel: NSObject, ObservableObject {
     @Published var bluetoothStatus: String = "Bluetooth初期化中..."
-    @Published var speechStatus: String = "音声認識の許可待ち..."
+    @Published var speechStatus: String = "Whisper API 待機中"
     @Published var devices: [CBPeripheral] = []
     @Published var connectedDeviceName: String = "未接続"
     @Published var isConnected: Bool = false
@@ -66,13 +66,17 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
     private var reconnectTimer: Timer?
     private var autoStreamPending: Bool = false
 
+    // OpenClaw Events Polling
+    private var eventPollTimer: Timer?
+    private var lastEventTimestamp: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+
     // Voice activity detection / sentence segmentation
     private enum VADPhase { case waiting, speaking, silence }
-    private let voiceOnThreshold: Float = 0.012
-    private let voiceOffThreshold: Float = 0.006  // much wider hysteresis gap
+    private let voiceOnThreshold: Float = 0.015  // Lowered from 0.025 to increase sensitivity
+    private let voiceOffThreshold: Float = 0.010 // Lowered from 0.015
     private let silenceDuration: TimeInterval = 2.0
     private let voiceHoldover: TimeInterval = 1.0  // stay in speaking at least 1s after last voice
-    private let rmsWindowSize: Int = 30  // sliding window for average RMS
+    private let rmsWindowSize: Int = 45  // Average over a slightly larger window to ignore sharp, short noises
     private var currentVADPhase: VADPhase = .waiting
     private var silenceTimer: Timer?
     private var finalizedSentences: [String] = []
@@ -89,10 +93,15 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
     private let preBufferMaxDuration: TimeInterval = 0.5  // keep last 0.5 seconds
     private var preBufferSampleCount: Int = 0
 
+    // Buffer for the current active speech session
+    private var currentSpeechBuffer: [Float] = []
+
+    // Local Apple Speech for Noise Filtering
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var speechAuthStatus: SFSpeechRecognizerAuthorizationStatus = .notDetermined
+
     private var activeStreamSessionID: UUID?
 
     private var currentCodecID: UInt8 = 1
@@ -101,8 +110,6 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
     private var lastPacketID: UInt16?
     private var lastChunkIndex: UInt8?
     private var isAppInBackground: Bool = false
-    private var pendingBackgroundSamples = [Float]()
-    private var pendingBackgroundSampleLimit: Int { Int(recognitionSampleRate * 45.0) } // Up to ~45s
 #if canImport(UIKit)
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 #endif
@@ -115,6 +122,44 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
             queue: .main,
             options: [CBCentralManagerOptionRestoreIdentifierKey: "com.xiao.voicebridge.central"]
         )
+        
+        startEventPolling()
+    }
+    
+    // MARK: - OpenClaw Asynchronous Event Polling
+    
+    private func startEventPolling() {
+        eventPollTimer?.invalidate()
+        // Initialize timestamp to roughly now, minus a few seconds to catch immediate boot events
+        lastEventTimestamp = Int64(Date().timeIntervalSince1970 * 1000) - 5000
+        
+        eventPollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.pollEvents()
+        }
+    }
+    
+    private func pollEvents() {
+        Task {
+            do {
+                let newEvents = try await OpenClawClient.shared.fetchEvents(since: self.lastEventTimestamp)
+                if !newEvents.isEmpty {
+                    await MainActor.run {
+                        for event in newEvents {
+                            // Update timestamp so we don't fetch this again
+                            if event.timestamp > self.lastEventTimestamp {
+                                self.lastEventTimestamp = event.timestamp
+                            }
+                            
+                            // Append the event text as a new message from the AI
+                            let entry = AIResponseEntry(userMessage: "通知 (Agent)", aiReply: event.text, isLoading: false, isError: false)
+                            self.aiResponses.append(entry)
+                        }
+                    }
+                }
+            } catch {
+                // Silently fail polling errors to avoid log spam
+            }
+        }
     }
 
     func setAppIsInBackground(_ inBackground: Bool) {
@@ -123,13 +168,9 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         appLifecycleStatus = inBackground ? "バックグラウンド" : "前面"
 
         if inBackground {
-            beginBackgroundExecutionWindow()
             if isStreaming {
                 transferStatus = "バックグラウンド受信中..."
             }
-        } else {
-            endBackgroundExecutionWindow()
-            recoverRecognitionIfNeededOnForeground()
         }
     }
 
@@ -140,7 +181,7 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
                 self.speechAuthStatus = status
                 switch status {
                 case .authorized:
-                    self.speechStatus = "音声認識: 許可済み"
+                    self.speechStatus = "音声認識: 許可済み (Whisper連携)"
                 case .denied:
                     self.speechStatus = "音声認識: 許可拒否"
                 case .restricted:
@@ -200,11 +241,11 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
             return
         }
         guard speechAuthStatus == .authorized else {
-            errorMessage = "iPhone側で音声認識の許可が必要です"
+            errorMessage = "iPhone側で音声認識の許可が必要です（設定 > プライバシー > 音声認識）"
             return
         }
         guard speechRecognizer?.isAvailable == true else {
-            errorMessage = "Speech Recognizerが利用できません"
+            errorMessage = "ローカル音声認識器(SFSpeechRecognizer)が利用できません"
             return
         }
         guard currentCodecID == codecPCM16_16K || currentCodecID == codecPCM16_8K else {
@@ -219,8 +260,6 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         pendingPCMByte = nil
         lastPacketID = nil
         lastChunkIndex = nil
-        pendingBackgroundSamples.removeAll(keepingCapacity: true)
-        needsRecognitionRecoveryOnForeground = false
         transferStatus = "受信開始 — 音声待ち"
         transcript = ""
         finalizedSentences.removeAll()
@@ -243,17 +282,39 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         pendingPCMByte = nil
         lastPacketID = nil
         lastChunkIndex = nil
-        pendingBackgroundSamples.removeAll(keepingCapacity: false)
-        needsRecognitionRecoveryOnForeground = false
         currentVADPhase = .waiting
         isAvatarActive = false
         vadState = "停止"
         silenceTimer?.invalidate()
         silenceTimer = nil
         resetVADState()
+        stopSpeechBuffering()
+#if !os(macOS)
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+#endif
+    }
+
+    private func startSpeechBuffering() {
+        currentSpeechBuffer.removeAll(keepingCapacity: true)
+        startRecognitionSession()
+    }
+
+    /// Flush the pre-buffer into the active speech buffer and recognizer.
+    /// This ensures the beginning of speech (captured before VAD triggered) is not lost.
+    private func flushPreBufferToCurrentSpeech() {
+        for chunk in preBuffer {
+            currentSpeechBuffer.append(contentsOf: chunk)
+            appendFloatSamplesToRecognition(chunk, sourceSampleRate: currentSourceSampleRate)
+        }
+        preBuffer.removeAll(keepingCapacity: true)
+        preBufferSampleCount = 0
+    }
+
+    private func stopSpeechBuffering() {
+        silenceTimer?.invalidate()
+        silenceTimer = nil
+        currentSpeechBuffer.removeAll(keepingCapacity: false)
         stopRecognitionSession()
-        deactivateSpeechAudioSession()  // Only deactivate audio session when fully stopping
-        endBackgroundExecutionWindow()
     }
 
     private func startRecognitionSession() {
@@ -262,8 +323,6 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
-
-        configureSpeechAudioSession()
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
@@ -278,62 +337,25 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         recognitionTask = speechRecognizer?.recognitionTask(with: request) { [weak self] result, error in
             DispatchQueue.main.async {
                 guard let self else { return }
-                // Ignore callbacks from old/cancelled sessions
                 guard mySessionID == self.recognitionSessionID else { return }
 
                 if let result {
                     self.currentPartialText = result.bestTranscription.formattedString
-                    self.updateDisplayTranscript()
-                }
-                if let _ = error {
-                    if self.isAppInBackground && self.isStreaming {
-                        self.errorMessage = "バックグラウンドで認識中断。前面復帰時に再開します"
-                        self.needsRecognitionRecoveryOnForeground = true
-                        self.stopRecognitionSession()
-                    } else if self.isStreaming {
-                        // Non-fatal: finalize partial text, return to VAD waiting
-                        let text = self.currentPartialText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !text.isEmpty {
-                            self.finalizedSentences.append(text)
-                            self.sendToOpenClaw(text)
-                        }
-                        self.currentPartialText = ""
-                        self.recognitionRequest = nil
-                        self.recognitionTask = nil
-                        self.currentVADPhase = .waiting
-                        self.isAvatarActive = false
-                        self.vadState = "音声待ち..."
-                        self.errorMessage = ""
-                        self.resetVADState()
-                        self.updateDisplayTranscript()
-                    }
+                    // We don't update display transcript here because Whisper will override it anyway
                 }
             }
         }
     }
 
-    /// Flush the pre-buffer into the active recognition session.
-    /// This ensures the beginning of speech (captured before VAD triggered) is not lost.
-    private func flushPreBufferToRecognizer() {
-        guard recognitionRequest != nil else { return }
-        for chunk in preBuffer {
-            appendFloatSamplesToRecognition(chunk, sourceSampleRate: currentSourceSampleRate)
-        }
-        preBuffer.removeAll(keepingCapacity: true)
-        preBufferSampleCount = 0
-    }
-
     private func stopRecognitionSession() {
-        silenceTimer?.invalidate()
-        silenceTimer = nil
-        // Increment session ID so any pending callbacks from this session are ignored
         recognitionSessionID += 1
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
-        // Do NOT deactivate audio session here — keep it alive during streaming
     }
+
+
 
     /// Reset all VAD signal processing state to prevent drift over time.
     private func resetVADState() {
@@ -357,19 +379,75 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
 
     private func finalizeCurrentSentence() {
         guard isStreaming else { return }
-        let text = currentPartialText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !text.isEmpty {
-            finalizedSentences.append(text)
-            sendToOpenClaw(text)
-        }
+        
+        let localDetectedText = currentPartialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Grab local copies for async processing
+        let samples = currentSpeechBuffer
+        let sampleRate = Int(currentSourceSampleRate)
+        
+        // Stop buffering and set phase to waiting, BUT keep avatar active so UI doesn't disappear
+        stopSpeechBuffering()
         currentPartialText = ""
-        // Stop recognition and go back to waiting for next voice
-        stopRecognitionSession()
         currentVADPhase = .waiting
-        isAvatarActive = false
-        vadState = "音声待ち..."
         resetVADState()
-        updateDisplayTranscript()
+        
+        // GATEKEEPER: If Apple Speech recognized absolutely NO words (empty string), it's just noise.
+        guard !localDetectedText.isEmpty, !samples.isEmpty else {
+            print("🗣️ VAD: Apple Speech detected no words. Classifying as noise. Discarding buffer.")
+            isAvatarActive = false
+            vadState = "音声待ち..."
+            return
+        }
+        
+        // Let UI know we are transmitting to Whisper API
+        print("🗣️ VAD: Silence detected. Preparing to send \(samples.count) samples to Whisper API...")
+        liveTranscript = ""
+        isProcessingAI = true
+        vadState = "Whisper処理中..."
+        
+        Task {
+            do {
+                print("🗣️ VAD: Calling WhisperClient.transcribe...")
+                let text = try await WhisperClient.shared.transcribe(samples: samples, sampleRate: sampleRate)
+                print("🗣️ VAD: Whisper API returned: '\(text)'")
+                
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                await MainActor.run {
+                    self.liveTranscript = ""
+                    if !trimmed.isEmpty {
+                        print("🗣️ VAD: Appending finalized sentence: '\(trimmed)'")
+                        self.finalizedSentences.append(trimmed)
+                        self.updateDisplayTranscript()
+                        self.sendToOpenClaw(trimmed)
+                    } else {
+                        print("🗣️ VAD: Received empty string after trimming.")
+                        self.isProcessingAI = self.aiResponses.contains { $0.isLoading }
+                    }
+                    self.isAvatarActive = false
+                    self.vadState = "音声待ち..."
+                }
+            } catch WhisperError.audioTooShort, WhisperError.hallucinationDetected {
+                // Ignore noise/hallucinations silently
+                print("🗣️ VAD: Audio too short or hallucination detected. Ignoring.")
+                await MainActor.run {
+                    self.liveTranscript = ""
+                    self.isProcessingAI = self.aiResponses.contains { $0.isLoading }
+                    self.isAvatarActive = false
+                    self.vadState = "音声待ち..."
+                }
+            } catch {
+                print("🗣️ VAD: Exception calling Whisper API: \(error.localizedDescription)")
+                await MainActor.run {
+                    self.errorMessage = "Whisper例外: \(error.localizedDescription)"
+                    self.liveTranscript = ""
+                    self.isProcessingAI = self.aiResponses.contains { $0.isLoading }
+                    self.isAvatarActive = false
+                    self.vadState = "音声待ち..."
+                }
+            }
+        }
     }
 
     func sendManualMessage(_ message: String) {
@@ -435,12 +513,11 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
             if windowAvg >= voiceOnThreshold {
                 currentVADPhase = .speaking
                 isAvatarActive = true
-                vadState = "🎙 認識中..."
-                transferStatus = "音声検出 — 認識開始"
+                vadState = "🎙 音声録音中..."
+                transferStatus = "音声検出 — バッファリング開始"
                 errorMessage = ""
-                startRecognitionSession()
-                // Flush pre-buffer into recognizer to capture speech onset
-                flushPreBufferToRecognizer()
+                startSpeechBuffering()
+                flushPreBufferToCurrentSpeech()
             }
 
         case .speaking:
@@ -502,13 +579,6 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
 
     private func tryAutoStartStreaming() {
         guard autoStreamPending, isBleAudioReady, !isStreaming else { return }
-        guard speechAuthStatus == .authorized, speechRecognizer?.isAvailable == true else {
-            // Retry after a short delay (speech auth may still be in progress)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.tryAutoStartStreaming()
-            }
-            return
-        }
         autoStreamPending = false
         startStreaming()
     }
@@ -597,84 +667,7 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         lastChunkIndex = chunkIndex
     }
 
-    private func appendFloatSamplesToRecognition(_ samples: [Float], sourceSampleRate: Double) {
-        guard sourceSampleRate > 0, !samples.isEmpty, let recognitionRequest else { return }
-        if samples.count == 1 {
-            let frameCount = AVAudioFrameCount(1)
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: recognitionAudioFormat, frameCapacity: frameCount) else { return }
-            buffer.frameLength = frameCount
-            buffer.floatChannelData?[0][0] = samples[0]
-            recognitionRequest.append(buffer)
-            return
-        }
 
-        // Resample both up/down using linear interpolation.
-        let durationSec = Double(samples.count - 1) / sourceSampleRate
-        let outputCount = max(1, Int(durationSec * recognitionSampleRate) + 1)
-        let frameCount = AVAudioFrameCount(outputCount)
-
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: recognitionAudioFormat, frameCapacity: frameCount) else { return }
-        buffer.frameLength = frameCount
-        guard let channelData = buffer.floatChannelData?[0] else { return }
-
-        let maxInputIndex = samples.count - 1
-        for outIndex in 0..<outputCount {
-            let sourcePosition = Double(outIndex) * sourceSampleRate / recognitionSampleRate
-            let leftIndex = min(maxInputIndex, Int(sourcePosition))
-            let rightIndex = min(maxInputIndex, leftIndex + 1)
-            let t = Float(sourcePosition - Double(leftIndex))
-            let left = samples[leftIndex]
-            let right = samples[rightIndex]
-            channelData[outIndex] = left + (right - left) * t
-        }
-
-        recognitionRequest.append(buffer)
-    }
-
-    private func beginBackgroundExecutionWindow() {
-#if canImport(UIKit)
-        guard backgroundTaskID == .invalid else { return }
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "XiaoVoiceBridgeStreaming") { [weak self] in
-            self?.endBackgroundExecutionWindow()
-        }
-#endif
-    }
-
-    private func endBackgroundExecutionWindow() {
-#if canImport(UIKit)
-        guard backgroundTaskID != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(backgroundTaskID)
-        backgroundTaskID = .invalid
-#endif
-    }
-
-    private func bufferSamplesForForegroundRecovery(_ samples: [Float]) {
-        guard !samples.isEmpty else { return }
-        pendingBackgroundSamples.append(contentsOf: samples)
-        let overflow = pendingBackgroundSamples.count - pendingBackgroundSampleLimit
-        if overflow > 0 {
-            pendingBackgroundSamples.removeFirst(overflow)
-        }
-    }
-
-    private func recoverRecognitionIfNeededOnForeground() {
-        guard isStreaming else {
-            pendingBackgroundSamples.removeAll(keepingCapacity: false)
-            needsRecognitionRecoveryOnForeground = false
-            return
-        }
-
-        if recognitionRequest == nil || needsRecognitionRecoveryOnForeground {
-            startRecognitionSession()
-            needsRecognitionRecoveryOnForeground = false
-        }
-
-        if !pendingBackgroundSamples.isEmpty {
-            appendFloatSamplesToRecognition(pendingBackgroundSamples, sourceSampleRate: currentSourceSampleRate)
-            pendingBackgroundSamples.removeAll(keepingCapacity: false)
-            transferStatus = "前面復帰: 認識再開"
-        }
-    }
 
     /// Simple first-order high-pass filter (~300Hz cutoff at 8kHz sample rate)
     /// Removes low-frequency rumble, air conditioning hum, etc.
@@ -737,6 +730,40 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         return floatSamples
     }
 
+    private func appendFloatSamplesToRecognition(_ samples: [Float], sourceSampleRate: Double) {
+        guard sourceSampleRate > 0, !samples.isEmpty, let recognitionRequest else { return }
+        if samples.count == 1 {
+            let frameCount = AVAudioFrameCount(1)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: recognitionAudioFormat, frameCapacity: frameCount) else { return }
+            buffer.frameLength = frameCount
+            buffer.floatChannelData?[0][0] = samples[0]
+            recognitionRequest.append(buffer)
+            return
+        }
+
+        // Resample both up/down using linear interpolation.
+        let durationSec = Double(samples.count - 1) / sourceSampleRate
+        let outputCount = max(1, Int(durationSec * recognitionSampleRate) + 1)
+        let frameCount = AVAudioFrameCount(outputCount)
+
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: recognitionAudioFormat, frameCapacity: frameCount) else { return }
+        buffer.frameLength = frameCount
+        guard let channelData = buffer.floatChannelData?[0] else { return }
+
+        let maxInputIndex = samples.count - 1
+        for outIndex in 0..<outputCount {
+            let sourcePosition = Double(outIndex) * sourceSampleRate / recognitionSampleRate
+            let leftIndex = min(maxInputIndex, Int(sourcePosition))
+            let rightIndex = min(maxInputIndex, leftIndex + 1)
+            let t = Float(sourcePosition - Double(leftIndex))
+            let left = samples[leftIndex]
+            let right = samples[rightIndex]
+            channelData[outIndex] = left + (right - left) * t
+        }
+
+        recognitionRequest.append(buffer)
+    }
+
     private func handleAudioPacket(_ data: Data) {
         guard isStreaming else { return }
         guard data.count > transportHeaderBytes else { return }
@@ -769,13 +796,10 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
             }
         }
 
-        // Feed audio to recognizer when actively speaking/silence
+        // Feed audio to Whisper buffer and Apple Speech when actively speaking/silence
         if currentVADPhase == .speaking || currentVADPhase == .silence {
-            if recognitionRequest != nil {
-                appendFloatSamplesToRecognition(samples, sourceSampleRate: currentSourceSampleRate)
-            } else if isAppInBackground {
-                bufferSamplesForForegroundRecovery(samples)
-            }
+            currentSpeechBuffer.append(contentsOf: samples)
+            appendFloatSamplesToRecognition(samples, sourceSampleRate: currentSourceSampleRate)
         }
 
         // VAD state machine
@@ -889,10 +913,7 @@ extension BluetoothSpeechViewModel: CBCentralManagerDelegate {
         pendingPCMByte = nil
         lastPacketID = nil
         lastChunkIndex = nil
-        pendingBackgroundSamples.removeAll(keepingCapacity: false)
-        needsRecognitionRecoveryOnForeground = false
-        endBackgroundExecutionWindow()
-        stopRecognitionSession()
+        stopSpeechBuffering()
         if let error {
             errorMessage = "切断エラー: \(error.localizedDescription)"
         }

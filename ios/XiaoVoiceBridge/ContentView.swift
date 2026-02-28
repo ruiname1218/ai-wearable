@@ -4,6 +4,7 @@ struct ContentView: View {
     @ObservedObject var viewModel: BluetoothSpeechViewModel
     @State private var showSettings = false
     @State private var manualInput: String = ""
+    @AppStorage("openaiApiKey") private var openaiApiKey: String = ""
 
     var body: some View {
         ZStack {
@@ -117,6 +118,7 @@ struct ContentView: View {
             Text(text)
                 .font(.body)
                 .foregroundStyle(.black)
+                .textSelection(.enabled)
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
                 .background(Color.white)
@@ -143,9 +145,11 @@ struct ContentView: View {
                         .stroke(Color.white.opacity(0.15), lineWidth: 1)
                 )
             } else {
-                Text(entry.aiReply)
+                Text(LocalizedStringKey(entry.aiReply))
                     .font(.body)
                     .foregroundStyle(.white)
+                    .textSelection(.enabled)
+                    .tint(.blue) // URL highlight color
                     .padding(.horizontal, 18)
                     .padding(.vertical, 14)
                     .background(entry.isError ? Color.red.opacity(0.2) : Color.white.opacity(0.08))
@@ -220,12 +224,15 @@ struct ContentView: View {
         VStack(spacing: 36) {
             Spacer()
             
-            Text(viewModel.vadState.contains("認識中") ? "Listening..." : "Waiting...")
+            let isHearingVoice = viewModel.vadState.contains("認識中") || viewModel.vadState.contains("録音中")
+            let isProcessing = viewModel.vadState.contains("処理中")
+            
+            Text(isProcessing ? "Thinking..." : (isHearingVoice ? "Listening..." : "Waiting..."))
                 .font(.headline.weight(.medium))
                 .foregroundStyle(.white.opacity(0.5))
             
             // Stunning 3D Liquid Metal Avatar
-            LiquidMetalBubble(isSpeaking: viewModel.vadState.contains("認識中"), rms: viewModel.audioLevelRMS)
+            LiquidMetalBubble(isSpeaking: isHearingVoice || isProcessing, rms: isProcessing ? 0.3 : viewModel.audioLevelRMS)
                 .frame(width: 250, height: 250)
             
             // Text being spoken right now
@@ -260,6 +267,12 @@ struct ContentView: View {
     private var settingsSheet: some View {
         NavigationStack {
             List {
+                Section("OpenAI API") {
+                    SecureField("sk-xxxxxxxx...", text: $openaiApiKey)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                }
+
                 Section("接続") {
                     Toggle("自動接続", isOn: $viewModel.autoConnectEnabled)
                         .tint(.white)
