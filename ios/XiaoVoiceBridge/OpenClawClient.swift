@@ -52,8 +52,9 @@ final class OpenClawClient {
         request.httpMethod = "POST"
         request.setValue("Bearer \(appToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("ios-user-1", forHTTPHeaderField: "x-ios-user-id")
 
-        let body = ["message": message]
+        let body: [String: Any] = ["message": message, "sessionId": "ios-user-1"]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: request)

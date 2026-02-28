@@ -84,6 +84,11 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
     private var highPassPrevOutput: Float = 0
     private var recognitionSessionID: Int = 0  // incremented each session, used to ignore stale callbacks
 
+    // Pre-buffer: stores recent audio so speech onset is not lost when VAD triggers
+    private var preBuffer: [[Float]] = []  // each element is one packet's worth of samples
+    private let preBufferMaxDuration: TimeInterval = 0.5  // keep last 0.5 seconds
+    private var preBufferSampleCount: Int = 0
+
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
@@ -307,6 +312,17 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         }
     }
 
+    /// Flush the pre-buffer into the active recognition session.
+    /// This ensures the beginning of speech (captured before VAD triggered) is not lost.
+    private func flushPreBufferToRecognizer() {
+        guard recognitionRequest != nil else { return }
+        for chunk in preBuffer {
+            appendFloatSamplesToRecognition(chunk, sourceSampleRate: currentSourceSampleRate)
+        }
+        preBuffer.removeAll(keepingCapacity: true)
+        preBufferSampleCount = 0
+    }
+
     private func stopRecognitionSession() {
         silenceTimer?.invalidate()
         silenceTimer = nil
@@ -326,6 +342,8 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         lastVoiceTime = .distantPast
         highPassPrevInput = 0
         highPassPrevOutput = 0
+        preBuffer.removeAll(keepingCapacity: true)
+        preBufferSampleCount = 0
     }
 
     private func updateDisplayTranscript() {
@@ -421,6 +439,8 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
                 transferStatus = "音声検出 — 認識開始"
                 errorMessage = ""
                 startRecognitionSession()
+                // Flush pre-buffer into recognizer to capture speech onset
+                flushPreBufferToRecognizer()
             }
 
         case .speaking:
@@ -738,7 +758,18 @@ final class BluetoothSpeechViewModel: NSObject, ObservableObject {
         let samples = decodePCMSamples(payload)
         guard !samples.isEmpty else { return }
 
-        // Only feed audio to recognizer when actively speaking/silence
+        // Always buffer recent audio for pre-buffer (used to capture speech onset)
+        if currentVADPhase == .waiting {
+            preBuffer.append(samples)
+            preBufferSampleCount += samples.count
+            // Trim to max duration
+            let maxSamples = Int(preBufferMaxDuration * currentSourceSampleRate)
+            while preBufferSampleCount > maxSamples && !preBuffer.isEmpty {
+                preBufferSampleCount -= preBuffer.removeFirst().count
+            }
+        }
+
+        // Feed audio to recognizer when actively speaking/silence
         if currentVADPhase == .speaking || currentVADPhase == .silence {
             if recognitionRequest != nil {
                 appendFloatSamplesToRecognition(samples, sourceSampleRate: currentSourceSampleRate)
