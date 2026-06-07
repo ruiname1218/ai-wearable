@@ -1,4 +1,9 @@
 # XIAO nRF52840 Sense -> iPhone 音声文字起こし（Friend互換形式）
+<video src="https://github.com/user-attachments/assets/0ca4afec-30b1-403f-9e6a-204054a6ed7d
+" width="100%" autoplay muted playsinline loop></video>
+
+
+
 
 XIAO nRF52840 Senseのマイク音声をBLEでiPhoneへ連続送信し、iPhone側で`Speech`フレームワークを使って文字起こしするプロトタイプです。  
 この版は`jhsu/Friend`のBLEフォーマットに合わせています。
